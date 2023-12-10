@@ -256,7 +256,7 @@ class BitType(DataType):
         self.definition = f'bit({size})'
 
         if convert:
-            self.to_python = lambda x: int(x)
+            self.to_python = lambda x: int.from_bytes(x, "big")
         
     def to_sql(self, value: int | bytes | str) -> str:
         if isinstance(value, int):
@@ -292,7 +292,12 @@ class TimeStampType(DataType):
             self.definition += " DEFAULT CURRENT_TIMESTAMP"
 
     def to_python(self, value: Any) -> datetime:
-        return datetime.fromisoformat(value)
+        if isinstance(value, datetime):
+            return value
+        elif isinstance(value, str):
+            return datetime.fromisoformat(value)
+        else:
+            raise TypeError(f'Cannot convert {value} to Python')
     
     def to_sql(self, value: Any) -> str:
         if isinstance(value, datetime):
@@ -331,7 +336,7 @@ class _SelectQuery:
         return self
 
     def __eq__(self, __value: Any) -> Self:
-        self.query += f' = {__value}'
+        self.query += f' = \'{__value}\''
         return self
     
     def __gt__(self, __value: Any) -> Self:
@@ -351,7 +356,7 @@ class _SelectQuery:
         return self
     
     def __ne__(self, __value: Any) -> Self:
-        self.query += f' != {__value}'
+        self.query += f' != \'{__value}\''
         return self
     
     def __str__(self) -> str:
@@ -499,9 +504,6 @@ class _FieldBase:
     
     def __invert__(self) -> _SelectQuery:
         return ~_SelectQuery(self)
-
-    def __call__(self, *args) -> _SelectQuery:
-        return _SelectQuery(self)(*args)
 
     def __contains__(self, __value: Any) -> _SelectQuery:
         return _SelectQuery(self) in __value
@@ -664,29 +666,9 @@ class _Records(Generic[_T]):
         else:
             return self.model(result)
 
-    @overload
     def filter(self, **kwargs) -> list[_T]:
-        ...
-
-    @overload
-    def filter(self, model: "Model", **kwargs) -> list[_T]:
-        ...
-
-    def filter(self, *args, **kwargs) -> list[_T]:
         self._select_data(**kwargs)
-
-        if args and isinstance(args[0], Model):
-            model = args[0]
-            for fk in self.model.foreign_keys:
-                if model.fields.get(fk.referenced_attr_name) is not None:
-                    break
-            else:
-                raise ValueError(f'{self.model.__name__} is not a foreign key of {model.__class__.__name__}')
-            return [self.model(data, **{fk.referenced_attr_name: model}) for data in _sessions[0].cursor.fetchall()]
-        elif args:
-            raise TypeError("First argument must be a Model")
-        else:
-            return [self.model(data) for data in _sessions[0].cursor.fetchall()]
+        return [self.model(data) for data in _sessions[0].cursor.fetchall()]
 
     def attach(self, model: "Model") -> list[_T]:
         for fk in self.model.foreign_keys:
@@ -701,7 +683,7 @@ class _Records(Generic[_T]):
             if field == fk:
                 break
 
-        return [self.model(i, **{name: model}) for i in select().from_(self.model).where(fk==value).execute().fetchall()]
+        return [self.model(i, **{name: model}) for i in select().from_(self.model).where(_SelectQuery(fk)==value).execute().fetchall()]
 
     def exclude(self, **kwargs) -> list[_T]:
         query = select().from_(self.model)
@@ -807,6 +789,10 @@ class _JoinedRecords(_Records, Generic[_T]):
         return [self.model(_sessions[0], data) for data in _sessions[0].cursor.fetchall()]
 
 
+class MatchingError(Exception):
+    pass
+
+
 class Model:
     fields: dict[str, Field | ForeignKey]
     primary_keys: list[Field | ForeignKey]
@@ -845,7 +831,7 @@ class Model:
 
         super_cls: type[Model] = cls.__bases__[0]
 
-        if issubclass(super_cls, Model) and super_cls is not Model:
+        if issubclass(super_cls, Model) and super_cls is not Model and cls.__name__ != super_cls.__name__:
             cls.primary_keys += super_cls.primary_keys
             cls.fields.update(super_cls.fields)
             cls.objects = _JoinedRecords(cls)
@@ -854,6 +840,7 @@ class Model:
 
         if model and cls.__name__ not in [c.__name__ for c in models]:
             models.append(cls)
+
             for attr in dir(cls):
                 if isinstance(field := getattr(cls, attr), (Field, ForeignKey)):
                     field.name = field.name or attr
@@ -877,9 +864,11 @@ class Model:
 
                     setattr(cls, attr, field)
         else:
-            for attr in dir(super_cls):
-                if not attr.startswith('__') and not attr.endswith('__'):
-                    setattr(cls, attr, getattr(super_cls, attr))
+            cls.primary_keys = super_cls.primary_keys
+            cls.fields = super_cls.fields
+            cls.foreign_keys = super_cls.foreign_keys
+            cls.unique_keys = super_cls.unique_keys
+            cls.primary_attr = super_cls.primary_attr
 
     def __setattr__(self, __name: str, __value: Any) -> None:
         super().__setattr__(__name, __value)
@@ -902,13 +891,16 @@ class Model:
             field = cls.fields[attr]
             name = cls.fields[attr].name or attr
             if field.primary:
-                self.primary_data[attr] = data[name]
+                try:
+                    self.primary_data[attr] = data[name]
+                except KeyError:
+                    raise MatchingError(f'{name} is not in `{cls.__name__}`.')
             if isinstance(field, Field):
                 value = data.get(name, _Undefiend)
                 if value is _Undefiend:
                     field = self.undefined_field(field)
                     value = field.default
-                field = field(value)
+                field = field.transform(value)
             elif isinstance(field, ForeignKey):
                 _sessions[0].execute(f'SELECT * FROM {field.table.__name__} WHERE {field.referenced_field.name} = \'{data[name]}\'')
                 arr = _sessions[0].cursor.fetchall()
