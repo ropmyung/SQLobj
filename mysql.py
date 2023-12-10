@@ -440,7 +440,7 @@ def select(*args: Union[RawFormat, "_FieldBase"]) -> _SelectQuery:
                 if isinstance(field, _FieldBase):
                     query += field.name + ", "
                 else:
-                    raise TypeError(f'{field} is not a field')
+                    raise TypeError(f'{field} is not a field. Try using RawFormat.')
             query.query = query.query[:-2]
     else:
         query += '*'
@@ -632,6 +632,7 @@ class _Records(Generic[_T]):
 
         for key, value in kwargs.items():
             query += f'{key} = \'{value}\' AND '
+
         query = query[:-5] + ";"
         _sessions[0].execute(query)
 
@@ -662,7 +663,7 @@ class _Records(Generic[_T]):
             raise TypeError("First argument must be a Model")
         else:
             return self.model(result)
-    
+
     @overload
     def filter(self, **kwargs) -> list[_T]:
         ...
@@ -673,6 +674,7 @@ class _Records(Generic[_T]):
 
     def filter(self, *args, **kwargs) -> list[_T]:
         self._select_data(**kwargs)
+
         if args and isinstance(args[0], Model):
             model = args[0]
             for fk in self.model.foreign_keys:
@@ -685,6 +687,31 @@ class _Records(Generic[_T]):
             raise TypeError("First argument must be a Model")
         else:
             return [self.model(data) for data in _sessions[0].cursor.fetchall()]
+
+    def attach(self, model: "Model") -> list[_T]:
+        for fk in self.model.foreign_keys:
+            if model.fields.get(fk.referenced_attr_name) is not None:
+                break
+        else:
+            raise ValueError(f'{self.model.__name__} is not a foreign key of {model.__class__.__name__}')
+
+        value = getattr(model, fk.referenced_attr_name)
+
+        for name, field in self.model.fields.items():
+            if field == fk:
+                break
+
+        return [self.model(i, **{name: model}) for i in select().from_(self.model).where(fk==value).execute().fetchall()]
+
+    def exclude(self, **kwargs) -> list[_T]:
+        query = select().from_(self.model)
+
+        for key, value in kwargs.items():
+            query += f' {key} != \'{value}\' AND'
+
+        query.query = query.query[:-5]
+
+        return [self.model(data) for data in query.execute().fetchall()]
 
     def all(self) -> list[_T]:
         _sessions[0].execute(f'SELECT * FROM {self.model.__name__};')
@@ -921,7 +948,7 @@ class _Record(_Records):
         self.obj = obj
         super().__init__(obj.__class__)
 
-    def get_value(self, field: str | Field, where: _SelectQuery = None) -> Any:
+    def get_value(self, field: str | Field | RawFormat, where: _SelectQuery = None) -> Any:
         if isinstance(field, Field):
             field = field.name
 
@@ -933,7 +960,7 @@ class _Record(_Records):
             for key, value in self.obj.primary_data.items():
                 query += f'{key} = {value} AND '
 
-        return query.execute().fetchone()[field]
+        return query.execute().fetchone()[str(field)]
 
     def update(self, **kwargs) -> _T:
         query = f'UPDATE {self.__class__.__name__} SET '
