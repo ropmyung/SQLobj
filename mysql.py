@@ -1,6 +1,6 @@
 import pymysql, json, enum
 from datetime import datetime
-from typing import Callable, Iterable, Generic, TypeVar, Any, overload
+from typing import Callable, Iterable, Generic, TypeVar, Union, Any, overload
 from typing_extensions import Self
 
 
@@ -23,16 +23,17 @@ class _Session:
         self.cursor = self.conn.cursor(pymysql.cursors.DictCursor)
         return self
 
-    def execute(self, query: str) -> None:
-        print(query)
+    def execute(self, query: str, commit: bool = False) -> None:
         try:
             print(f'OK, Affected rows: {self.cursor.execute(query)}')
             _Session.query = query
+            if commit:
+                self.conn.commit()
         except AttributeError:
             raise RuntimeError("Session is not connected")
-        except pymysql.err.ProgrammingError as e:
+        except Exception as e:
             print(query)
-            raise ValueError("Invalid query", *e.args)
+            raise e
 
     def close(self) -> None:
         self.conn.close()
@@ -313,7 +314,203 @@ class RawFormat:
         return self.value
 
 
-class Field:
+class _SelectQuery:
+    def __init__(self, field: "_FieldBase" = None) -> None:
+        if field is None:
+            self.query = ''
+        else:
+            self.query = str(field)
+
+    def __add__(self, __value: str | Self) -> Self:
+        if isinstance(__value, str):
+            self.query += __value
+        elif isinstance(__value, _SelectQuery):
+            self.query += str(__value)
+        else:
+            return NotImplemented
+        return self
+
+    def __eq__(self, __value: Any) -> Self:
+        self.query += f' = {__value}'
+        return self
+    
+    def __gt__(self, __value: Any) -> Self:
+        self.query += f' > {__value}'
+        return self
+    
+    def __lt__(self, __value: Any) -> Self:
+        self.query += f' < {__value}'
+        return self
+    
+    def __ge__(self, __value: Any) -> Self:
+        self.query += f' >= {__value}'
+        return self
+    
+    def __le__(self, __value: Any) -> Self:
+        self.query += f' <= {__value}'
+        return self
+    
+    def __ne__(self, __value: Any) -> Self:
+        self.query += f' != {__value}'
+        return self
+    
+    def __str__(self) -> str:
+        return self.query
+    
+    def __and__(self, __value: Any) -> Self:
+        self.query += f' AND {__value}'
+        return self
+    
+    def __or__(self, __value: Any) -> Self:
+        self.query += f' OR {__value}'
+        return self
+    
+    def __invert__(self) -> Self:
+        self.query = f'NOT {self.query}'
+        return self
+
+    def __call__(self, *args) -> Self:
+        self.query += f'({", ".join(map(lambda x: "`%s`" % x, args))})'
+        return self
+
+    def __contains__(self, __value: Any) -> Self:
+        if isinstance(__value, str):
+            self.query += f' LIKE "%{__value}%"'
+        elif isinstance(__value, Iterable):
+            self.query += f' IN ({", ".join(map(str, __value))})'
+        return self
+
+    def __iter__(self) -> Iterable[str]:
+        return iter(self.query.split())
+    
+    def __len__(self) -> int:
+        return len(self.query.split())
+
+    def from_(self, table: type["Model"]) -> Self:
+        self.query += f' FROM {table.__name__}'
+        return self
+    
+    def join(self, table: type["Model"]) -> Self:
+        self.query += f' INNER JOIN {table.__name__}'
+        return self
+    
+    def on(self, condition: Self) -> Self:
+        self.query += f' ON {condition}'
+        return self
+
+    def where(self, condition: Self) -> Self:
+        self.query += f' WHERE {condition}'
+        return self
+
+    def group_by(self, *args: "_FieldBase") -> Self:
+        self.query += f' GROUP BY {", ".join(map(str, args))}'
+        return self
+
+    def having(self, condition: Self) -> Self:
+        self.query += f' HAVING {condition}'
+        return self
+    
+    def order_by(self, field: "_FieldBase", descending: bool = None) -> Self:
+        self.query += f' ORDER BY {field}'
+        if descending:
+            self.query += ' DESC'
+        return self
+    
+    def limit(self, limit: int) -> Self:
+        self.query += f' LIMIT {limit}'
+        return self
+
+    def offset(self, offset: int) -> Self:
+        self.query += f' OFFSET {offset}'
+        return self
+
+    def execute(self):
+        _sessions[0].execute(self.query + ';')
+        return _sessions[0].cursor
+
+
+def select(*args: Union[RawFormat, "_FieldBase"]) -> _SelectQuery:
+    query = _SelectQuery() + "SELECT "
+
+    if args:
+        if isinstance(args[0], RawFormat):
+            query += args[0].value
+        else:
+            for field in args:
+                if isinstance(field, _FieldBase):
+                    query += field.name + ", "
+                else:
+                    raise TypeError(f'{field} is not a field')
+            query.query = query.query[:-2]
+    else:
+        query += '*'
+    return query
+
+
+class _FieldBase:
+    def __init__(self, *, pk: bool, nullable: bool, default: Any, name: str) -> None:
+        self.name = name
+
+        if nullable and not pk:
+            if default is None:
+                self.definition += "DEFAULT NULL "
+            elif isinstance(default, RawFormat):
+                self.definition += f'DEFAULT {default.value} '
+            else:
+                self.definition += f'DEFAULT {self.type.default_format(default)} '
+        else:
+            self.definition += "NOT NULL "
+            if isinstance(default, RawFormat):
+                self.definition += f'DEFAULT {default.value} '
+            elif default is not None:
+                self.definition += f'DEFAULT {self.type.default_format(default)} '
+
+    def __str__(self) -> str:
+        return self.name
+
+    def __eq__(self, __value: str | Self) -> bool:
+        if isinstance(__value, str):
+            return self.name == __value
+        elif isinstance(__value, _FieldBase):
+            return self.name == __value.name
+        else:
+            return False
+
+    def __gt__(self, __value: str | Self) -> _SelectQuery:
+        return _SelectQuery(self) > __value
+    
+    def __lt__(self, __value: str | Self) -> _SelectQuery:
+        return _SelectQuery(self) < __value
+
+    def __ge__(self, __value: str | Self) -> _SelectQuery:
+        return _SelectQuery(self) >= __value
+    
+    def __le__(self, __value: str | Self) -> _SelectQuery:
+        return _SelectQuery(self) <= __value
+    
+    def __ne__(self, __value: str | Self) -> _SelectQuery:
+        return _SelectQuery(self) != __value
+    
+    def __and__(self, __value: str | Self) -> _SelectQuery:
+        return _SelectQuery(self) & __value
+    
+    def __or__(self, __value: str | Self) -> _SelectQuery:
+        return _SelectQuery(self) | __value
+    
+    def __invert__(self) -> _SelectQuery:
+        return ~_SelectQuery(self)
+
+    def __call__(self, *args) -> _SelectQuery:
+        return _SelectQuery(self)(*args)
+
+    def __contains__(self, __value: Any) -> _SelectQuery:
+        return _SelectQuery(self) in __value
+
+    def to_query(self) -> _SelectQuery:
+        return _SelectQuery(self)
+
+
+class Field(_FieldBase):
     def __init__(
         self,
         type: DataType,
@@ -327,7 +524,6 @@ class Field:
         raw_args: Iterable[str] = (),
         name: str = None
     ) -> None:
-        self.name = name
         self.type = type
         self.default = default
         self.primary = pk
@@ -343,38 +539,13 @@ class Field:
         if auto_increament:
             self.definition += " AUTO_INCREMENT"
 
-        if nullable and not pk:
-            if default is None:
-                self.definition += "DEFAULT NULL "
-            elif isinstance(default, RawFormat):
-                self.definition += f'DEFAULT {default.value} '
-            else:
-                self.definition += f'DEFAULT {self.type.default_format(default)} '
-        else:
-            self.definition += "NOT NULL "
-            if isinstance(default, RawFormat):
-                self.definition += f'DEFAULT {default.value} '
-            elif default is not None:
-                self.definition += f'DEFAULT {self.type.default_format(default)} '
+        super().__init__(pk=pk, nullable=nullable, default=default, name=name)
+
         for arg in raw_args:
             self.definition += arg + ' '
 
         self.definition = self.definition.removesuffix(' ')
         self.set_value = None
-
-    def __call__(self, value: Any) -> Any:
-        return self.transform(value)
-
-    def __str__(self) -> str:
-        return self.name
-
-    def __eq__(self, __value: str | Self) -> bool:
-        if isinstance(__value, str):
-            return self.name == __value
-        elif isinstance(__value, Field):
-            return self.name == __value.name
-        else:
-            return False
 
     def setter(self, func: Callable[[Any], None]) -> None:
         self.set_value = func
@@ -390,7 +561,7 @@ RESTRICT = "RESTRICT"
 Specifying RESTRICT (or NO ACTION) is the same as omitting the ON DELETE or ON UPDATE clause."""
 
 
-class ForeignKey:
+class ForeignKey(_FieldBase):
     def __init__(
         self,
         table: type["Model"],
@@ -415,20 +586,8 @@ class ForeignKey:
 
         self.type = self.referenced_field.type
         self.definition = self.referenced_field.type.definition + ' '
-        
-        if nullable and not pk:
-            if default is None:
-                self.definition += "DEFAULT NULL "
-            elif isinstance(default, RawFormat):
-                self.definition += f'DEFAULT {default.value} '
-            else:
-                self.definition += f'DEFAULT {self.type.default_format(default)} '
-        else:
-            self.definition += "NOT NULL "
-            if isinstance(default, RawFormat):
-                self.definition += f'DEFAULT {default.value} '
-            elif default is not None:
-                self.definition += f'DEFAULT {self.type.default_format(default)} '
+
+        super().__init__(pk=pk, nullable=nullable, default=default, name=name)
 
         self.definition += f',\n\tFOREIGN KEY({referenced_attr_name}) REFERENCES {table.__name__}({self.referenced_field.name})'
 
@@ -438,43 +597,14 @@ class ForeignKey:
             self.definition += f'\n\tON UPDATE {on_update}'
 
         self.table = table
-        self.name: str = name
         self.primary = pk
         self.unique = unique
         self.only_one = only_one
-        
-
-    def __str__(self) -> str:
-        return self.name
-
-    def __eq__(self, __value: str | Self) -> bool:
-        if isinstance(__value, str):
-            return self.name == __value
-        elif isinstance(__value, Field):
-            return self.name == __value.name
-        else:
-            return False
 
 
-class Undefiend: ...
+class _Undefiend: ...
 
 _T = TypeVar("_T", bound="Model")
-
-
-class Query:
-    def __init__(self, query: str) -> None:
-        self.query = query
-
-    def __str__(self) -> str:
-        return self.query
-    
-    def where(self, **kwargs) -> Self:
-        query = self.query + f'\nWHERE '
-
-        for key, value in kwargs.items():
-            query += f'{key} = \'{value}\' AND '
-        query = query[:-5] + ";"
-        return Query(query)
 
 
 class _Records(Generic[_T]):
@@ -516,9 +646,10 @@ class _Records(Generic[_T]):
     def get(self, *args, **kwargs) -> _T | None:
         self._select_data(**kwargs)
         result = _sessions[0].cursor.fetchone()
+
         if result is None:
             return None
-        
+
         if args and isinstance(args[0], Model):
             model = args[0]
             for fk in self.model.foreign_keys:
@@ -558,6 +689,19 @@ class _Records(Generic[_T]):
     def all(self) -> list[_T]:
         _sessions[0].execute(f'SELECT * FROM {self.model.__name__};')
         return [self.model(_sessions[0], data) for data in _sessions[0].cursor.fetchall()]
+
+    def count(self, condition: _SelectQuery = _SelectQuery(), **kwargs) -> int:
+        query = select(RawFormat("COUNT(*)")).from_(self.model)
+
+        if kwargs:
+            for key, value in kwargs.items():
+                condition += f'{key} = {value} AND '
+
+            query.query = query.query[:-5]
+
+        query.where(condition)
+
+        return query.execute().fetchone()['COUNT(*)']
 
     def update(self, **kwargs) -> None:
         query = f'UPDATE {self.model.__name__} SET '
@@ -703,6 +847,8 @@ class Model:
                     
                     if field.unique:
                         cls.unique_keys.append(field)
+
+                    setattr(cls, attr, field)
         else:
             for attr in dir(super_cls):
                 if not attr.startswith('__') and not attr.endswith('__'):
@@ -731,8 +877,8 @@ class Model:
             if field.primary:
                 self.primary_data[attr] = data[name]
             if isinstance(field, Field):
-                value = data.get(name, Undefiend)
-                if value is Undefiend:
+                value = data.get(name, _Undefiend)
+                if value is _Undefiend:
                     field = self.undefined_field(field)
                     value = field.default
                 field = field(value)
@@ -775,19 +921,19 @@ class _Record(_Records):
         self.obj = obj
         super().__init__(obj.__class__)
 
-    def get_value(self, field: str | Field) -> Any:
+    def get_value(self, field: str | Field, where: _SelectQuery = None) -> Any:
         if isinstance(field, Field):
             field = field.name
 
-        query = f'SELECT {field} FROM {self.obj.__class__.__name__} WHERE '
+        query = select(field).from_(self.obj.__class__)
 
-        for key, value in self.obj.primary_data.items():
-            query += f'{key} = {value} AND '
+        if where:
+            query += f' {where}'
+        else:
+            for key, value in self.obj.primary_data.items():
+                query += f'{key} = {value} AND '
 
-        query = query[:-5] + ";"
-        _sessions[0].execute(query)
-
-        return _sessions[0].cursor.fetchone()[field]
+        return query.execute().fetchone()[field]
 
     def update(self, **kwargs) -> _T:
         query = f'UPDATE {self.__class__.__name__} SET '
