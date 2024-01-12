@@ -37,6 +37,7 @@ class _Session:
 
     def disconnect(self) -> None:
         self.conn.close()
+        self.conn = None
 
     def __enter__(self):
         self.connect()
@@ -871,16 +872,11 @@ class Model:
             cls.primary_attr = super_cls.primary_attr
 
     def __setattr__(self, __name: str, __value: Any) -> None:
-        super().__setattr__(__name, __value)
-
-        if self.matched and not __name.startswith('_'):
-            field = self.fields.get(__name)
-
-            if field is not None:
-                if isinstance(field, Field) and field.set_value is not None:
-                    field.set_value(__value)
-                else:
-                    self.object.update(**{__name: field.type.to_sql(__value)})
+        if isinstance(__value, RawFormat):
+            self.object.update(**{__name: __value.value})
+            super().__setattr__(__name, self.object.get_value(__name))
+        else:
+            super().__setattr__(__name, __value)
 
     def match_attr(self, data: dict[str, Any], **kwargs) -> Self:
         cls = self.__class__
@@ -955,7 +951,7 @@ class _Record(_Records):
         return query.execute().fetchone()[str(field)]
 
     def update(self, **kwargs) -> _T:
-        query = f'UPDATE {self.__class__.__name__} SET '
+        query = f'UPDATE {self.obj.__name__} SET '
 
         for key, value in kwargs.items():
             if (field := self.obj.fields.get(key)) is None:
