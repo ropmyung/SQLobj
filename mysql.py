@@ -35,7 +35,7 @@ class _Session:
             print(query)
             raise e
 
-    def close(self) -> None:
+    def disconnect(self) -> None:
         self.conn.close()
 
     def __enter__(self):
@@ -43,7 +43,7 @@ class _Session:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.close()
+        self.disconnect()
 
 
 _sessions: list[_Session | None] = [None]
